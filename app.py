@@ -7,6 +7,7 @@ from models import Item, SessionLocal
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from groq import Groq
+from models import Item, ItemList, SessionLocal
 
 
 app = Flask(__name__)
@@ -47,7 +48,12 @@ HEALTHY = {
 @app.route("/items", methods=["GET"])
 def get_items():
     items = db.query(Item).all()
-    return jsonify([{"id":i.id,"name":i.name,"qty":i.qty,"expiry":i.expiry} for i in items])
+    return jsonify([{
+        "id": i.id,
+        "name": i.name,
+        "qty": i.qty,
+        "expiry": i.expiry
+    } for i in items])
 
 
 @app.route("/items", methods=["POST"])
@@ -56,12 +62,15 @@ def add_item():
     prompt = data.get("prompt", "")
 
     if not prompt or not prompt.strip():
-        return {"error": "Prompt is required in the request body"}, 400
+        return {"error": "Prompt is required"}, 400
 
+    # ----------------------------------------------------
+    # 1. RUN GROQ EXTRACTION FIRST (so parsed_items exists)
+    # ----------------------------------------------------
     extraction_prompt = (
-        "Extract all food and grocery items, quantity, AND expiration dates from the user request. "
-        "Return ONLY a JSON array of objects in this format: "
-        '[{"item": "item name", "qty": "quantity or empty string", "expires": "YYYY-MM-DD or empty string"}]. '
+        "Extract all food and grocery items, quantity, AND expiration dates "
+        "from the user request. Return ONLY a JSON array like: "
+        '[{\"item\": \"item name\", \"qty\": \"quantity\", \"expires\": \"YYYY-MM-DD\"}]. '
         f'User Request: \"{prompt}\"'
     )
 
@@ -69,39 +78,100 @@ def add_item():
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": extraction_prompt}],
         max_tokens=300,
-        temperature=0.2
+        temperature=0.1
     )
 
-    # Correct way
     items_text = response.choices[0].message.content.strip()
-   
 
-    if items_text == "" or items_text.lower() in ["[]", "none"]:
-        return jsonify({"message": "Please add grocery or food items list"}), 200
+    # Nothing extracted → return but still include reminders later if needed
+    if not items_text or items_text.lower() in ["[]", "none"]:
+        parsed_items = []
+    else:
+        # ----------------------------------------------------
+        # 2. PARSE JSON OUTPUT FROM GROQ
+        # ----------------------------------------------------
+        try:
+            if items_text.startswith("[") and items_text.endswith("]"):
+                parsed_items = json.loads(items_text)
+            else:
+                import re
+                match = re.search(r'\[.*\]', items_text, re.DOTALL)
+                parsed_items = json.loads(match.group()) if match else []
+        except Exception as e:
+            return {"error": f"Failed to parse items: {str(e)}"}, 400
+
+    # ----------------------------------------------------
+    # 3. CHECK RECENTLY BOUGHT ITEMS (last 7 days)
+    # ----------------------------------------------------
+    today = datetime.today().date()
+    last_week_start = today - timedelta(days=7)
+    last_week_end = today - timedelta(days=1)  # exclude today
+
+    recent_lists = db.query(ItemList).filter(
+        ItemList.created_at >= last_week_start,
+        ItemList.created_at <= last_week_end
+    ).all()
     
-    try:
-        # Try JSON load directly
-        if items_text.startswith("[") and items_text.endswith("]"):
-            items_list = json.loads(items_text)
+    recent_item_names = {
+        item.name.lower()
+        for lst in recent_lists
+        for item in lst.items
+    }
+
+    # Today's added items from parsed_items
+    today_item_names = {
+        item.get("item", "").lower()
+        for item in parsed_items
+    }
+
+    # Items bought last week but NOT today
+    missing_items = sorted(list(recent_item_names - today_item_names))
+
+    reminders = []
+    if missing_items:
+        if len(missing_items) == 2:
+            text = f"{missing_items[0]} and {missing_items[1]}"
+        elif len(missing_items) > 2:
+            text = ", ".join(missing_items[:-1]) + f", and {missing_items[-1]}"
         else:
-            # Fallback: extract JSON from free-text
-            import re
-            json_match = re.search(r'\[.*\]', items_text, re.DOTALL)
-            items_list = json.loads(json_match.group()) if json_match else []
+            text = missing_items[0]
 
-        for item in items_list:
-            new = Item(
-                name=item.get("item", "Unknown"),
-                qty=int(item.get("qty", 1)) if item.get("qty") else 1,
-                expiry=item.get("expires", "")
-            )
-            db.add(new)
+        reminders.append(
+            f"You bought {text} last week, If you want to add it again, tell me with quantity and expiry date"
+        )
 
-        db.commit()
-        return jsonify({"message": "Items added successfully", "count": len(items_list)})
+    # If the user added nothing AND we want to show reminders anyway
+    if not parsed_items:
+        return jsonify({
+            "message": "Please add grocery or food items list",
+            "reminders": reminders
+        }), 200
 
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
-        return {"error": f"Failed to parse items: {str(e)}"}, 400
+    # ----------------------------------------------------
+    # 4. SAVE NEW LIST + ITEMS
+    # ----------------------------------------------------
+    new_list = ItemList()
+    db.add(new_list)
+    db.commit()
+    db.refresh(new_list)
+
+    for item in parsed_items:
+        entry = Item(
+            list_id=new_list.id,
+            name=item.get("item", "Unknown"),
+            qty=item.get("qty", ""),
+            expiry=item.get("expires", "")
+        )
+        db.add(entry)
+
+    db.commit()
+
+    return jsonify({
+        "message": "Items added successfully",
+        "list_date": str(new_list.created_at),
+        "items_added": len(parsed_items),
+        "reminders": reminders
+    })
 
 
 @app.route("/expiry")
