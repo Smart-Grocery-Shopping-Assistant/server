@@ -4,9 +4,9 @@ import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from models import Item, SessionLocal
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from google import genai
+from groq import Groq
 
 
 app = Flask(__name__)
@@ -16,20 +16,31 @@ CORS(app)
 db = SessionLocal()
 load_dotenv()
 
-# Gemini API Setup
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY is not set in environment variables")
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+if not GROK_API_KEY:
+    raise RuntimeError("GROK_API_KEY is not set in environment variables")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-print("Gemini API client initialized")
+client = Groq(api_key=os.environ.get("GROK_API_KEY"))
+print("Grok API client initialized")
 
 
 HEALTHY = {
-"White Bread": "Brown Bread",
-"Sugar": "Honey",
-"Milk": "Low Fat Milk",
-"Chips": "Roasted Peanuts"
+    "White Bread": "Brown Bread (or Whole Grain)",
+    "White Rice": "Brown Rice (or Quinoa)",
+    "Regular Pasta": "Whole Wheat Pasta",
+    "Sugar": "Honey (or Maple Syrup)",
+    "Candy": "Dark Chocolate (70%+ Cocoa)",
+    "Ice Cream": "Frozen Yogurt (or Fruit Sorbet)",
+    "Milk": "Low Fat Milk (or Skim Milk)",
+    "Full Fat Milk": "Low Fat Milk",
+    "Sour Cream": "Plain Greek Yogurt",
+    "Butter": "Olive Oil (or Avocado)",
+    "Regular Mayonnaise": "Light Mayonnaise (or Hummus)",
+    "Chips": "Roasted Peanuts (or Popcorn)",
+    "Potato Chips": "Baked Veggie Chips",
+    "Soda": "Sparkling Water (with fruit)",
+    "Bacon": "Lean Turkey Bacon",
+    "Ground Beef (high fat)": "Lean Ground Beef (90/10 or higher)",
 }
 
 
@@ -51,23 +62,33 @@ def add_item():
         "Extract all food and grocery items, quantity, AND expiration dates from the user request. "
         "Return ONLY a JSON array of objects in this format: "
         '[{"item": "item name", "qty": "quantity or empty string", "expires": "YYYY-MM-DD or empty string"}]. '
-        f'User Request: "{prompt}"'
+        f'User Request: \"{prompt}\"'
     )
-    
-    response = client.models.generate_content(
-        model="gemini-2.5-flash-lite",
-        contents=extraction_prompt
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": extraction_prompt}],
+        max_tokens=300,
+        temperature=0.2
     )
+
+    # Correct way
+    items_text = response.choices[0].message.content.strip()
+   
+
+    if items_text == "" or items_text.lower() in ["[]", "none"]:
+        return jsonify({"message": "Please add grocery or food items list"}), 200
     
     try:
-        items_text = response.text.strip()
+        # Try JSON load directly
         if items_text.startswith("[") and items_text.endswith("]"):
             items_list = json.loads(items_text)
         else:
+            # Fallback: extract JSON from free-text
             import re
             json_match = re.search(r'\[.*\]', items_text, re.DOTALL)
             items_list = json.loads(json_match.group()) if json_match else []
-        
+
         for item in items_list:
             new = Item(
                 name=item.get("item", "Unknown"),
@@ -75,19 +96,22 @@ def add_item():
                 expiry=item.get("expires", "")
             )
             db.add(new)
-        
+
         db.commit()
-        return jsonify({"message": "Items Added", "count": len(items_list)})
-    
+        return jsonify({"message": "Items added successfully", "count": len(items_list)})
+
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         return {"error": f"Failed to parse items: {str(e)}"}, 400
 
 
 @app.route("/expiry")
 def expiring():
-    today = datetime.today().strftime("%Y-%m-%d")
-    items = db.query(Item).filter(Item.expiry <= today).all()
-    return jsonify([i.name for i in items])
+    today = datetime.today().date()
+    target = today + timedelta(days=7)
+
+    items = db.query(Item).filter(Item.expiry == target).all()
+    return jsonify([{"name": i.name, "expiry": i.expiry} for i in items])
+
 
 
 @app.route("/recommend/<name>")
@@ -104,4 +128,4 @@ def missing():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=8000, debug=True)
