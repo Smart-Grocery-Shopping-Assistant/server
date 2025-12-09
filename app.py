@@ -174,27 +174,68 @@ def add_item():
     })
 
 
-@app.route("/expiry")
+@app.route("/expiry", methods=["GET"])
 def expiring():
     today = datetime.today().date()
     target = today + timedelta(days=7)
 
-    items = db.query(Item).filter(Item.expiry == target).all()
-    return jsonify([{"name": i.name, "expiry": i.expiry} for i in items])
+    items = db.query(Item).filter(
+        Item.expiry >= today,
+        Item.expiry <= target
+    ).all()
+
+    reminders = []
+
+    for item in items:
+        try:
+            # Convert expiry string to date
+            expiry_date = datetime.strptime(item.expiry, "%Y-%m-%d").date() if isinstance(item.expiry, str) else item.expiry
+            days_left = (expiry_date - today).days
+
+            if days_left == 0:
+                reminder_text = f"{item.name} expires today!"
+            elif days_left == 1:
+                reminder_text = f"{item.name} expires tomorrow!"
+            else:
+                reminder_text = f"{item.name} expires in {days_left} days (on {expiry_date})"
+
+            reminders.append({
+                "name": item.name,
+                "expiry": str(expiry_date),
+                "reminder": reminder_text
+            })
+        except Exception as e:
+            print(f"Failed to parse expiry for {item.name}: {e}")
+
+    if not reminders:
+        return jsonify({"message": "No items expiring in the next 7 days."}), 200
+
+    return jsonify(reminders)
 
 
 
-@app.route("/recommend/<name>")
-def recommend(name):
-    return jsonify({"alternative": HEALTHY.get(name, "No suggestion")})
-
-
-@app.route("/missing")
-def missing():
+@app.route("/recommend", methods=["GET"])
+def recommend_items():
+    # Fetch all items in the pantry
     items = db.query(Item).all()
-    if len(items) < 3:
-        return jsonify(["Rice", "Vegetables"])
-    return jsonify([])
+
+    recommendations = []
+    for item in items:
+        original_name = item.name
+        suggestion = HEALTHY.get(original_name, None)
+        if suggestion:
+            recommendations.append({
+                "item": original_name,
+                "suggestion": suggestion,
+                "qty": item.qty,
+                "expiry": item.expiry
+            })
+
+    if not recommendations:
+        return jsonify({"message": "No healthy alternatives available"}), 200
+
+    return jsonify(recommendations)
+
 
 
 if __name__ == "__main__":
